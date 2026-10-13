@@ -61,8 +61,19 @@ def fetch_bars(client, symbol, start, end):
             page_token=page_token,
         )
         bar_set = client.get_stock_bars(request)
-        if symbol in bar_set:
-            all_bars.extend(bar_set[symbol])
+
+        # In alpaca-py, bar_set is a BarSet model whose bars dictionary is at .data.
+        # Checking 'symbol in bar_set' checks model fields, which returns False.
+        # We must inspect bar_set.data directly:
+        bars = []
+        if hasattr(bar_set, "data") and symbol in bar_set.data:
+            bars = bar_set.data[symbol]
+        elif symbol in bar_set:
+            bars = bar_set[symbol]
+
+        all_bars.extend(bars)
+        print(f"Fetched batch: {len(bars)} bars for {symbol} (page_token={page_token})")
+
         page_token = getattr(bar_set, "next_page_token", None)
         if not page_token:
             break
@@ -78,7 +89,9 @@ def main():
 
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=LOOKBACK_DAYS)
+    print(f"Querying Alpaca for {SYMBOL} from {start:%Y-%m-%d %H:%M} to {end:%Y-%m-%d %H:%M} UTC...")
     bars = fetch_bars(client, SYMBOL, start, end)
+    print(f"Total bars fetched from Alpaca: {len(bars)}")
 
     rows = [
         (
@@ -95,14 +108,18 @@ def main():
         for bar in bars
     ]
 
+    print(f"Connecting to Neon database...")
     with psycopg.connect(database_url) as conn:
         with conn.cursor() as cur:
             cur.execute(DDL)
             if rows:
+                print(f"Upserting {len(rows)} bars into stock_bars table...")
                 cur.executemany(UPSERT, rows)
+            else:
+                print("No rows to upsert.")
         conn.commit()
 
-    print(f"Upserted {len(rows)} one-minute bars for {SYMBOL} "
+    print(f"Successfully upserted {len(rows)} one-minute bars for {SYMBOL} "
           f"({start:%Y-%m-%d %H:%M} to {end:%Y-%m-%d %H:%M} UTC)")
 
 
