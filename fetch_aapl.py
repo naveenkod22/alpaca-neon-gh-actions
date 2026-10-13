@@ -1,4 +1,4 @@
-"""Fetch the last 10 minutes of AAPL 1-minute bars from Alpaca and upsert them
+"""Fetch the last 7 days of AAPL 1-minute bars from Alpaca and upsert them
 into a Neon Postgres database.
 
 Environment variables (set as GitHub Secrets in Actions):
@@ -15,7 +15,7 @@ from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
 SYMBOL = "AAPL"
-LOOKBACK_MINUTES = 10
+LOOKBACK_DAYS = 7
 
 DDL = """
 CREATE TABLE IF NOT EXISTS stock_bars (
@@ -48,15 +48,25 @@ ON CONFLICT (symbol, ts) DO UPDATE SET
 
 
 def fetch_bars(client, symbol, start, end):
-    request = StockBarsRequest(
-        symbol_or_symbols=symbol,
-        timeframe=TimeFrame.Minute,
-        start=start,
-        end=end,
-        feed="iex",  # free Alpaca plan -> IEX feed (SIP needs a paid subscription)
-    )
-    bar_set = client.get_stock_bars(request)
-    return list(bar_set[symbol])
+    all_bars = []
+    page_token = None
+    while True:
+        request = StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=TimeFrame.Minute,
+            start=start,
+            end=end,
+            feed="iex",  # free Alpaca plan -> IEX feed (SIP needs a paid subscription)
+            limit=10000,
+            page_token=page_token,
+        )
+        bar_set = client.get_stock_bars(request)
+        if symbol in bar_set:
+            all_bars.extend(bar_set[symbol])
+        page_token = getattr(bar_set, "next_page_token", None)
+        if not page_token:
+            break
+    return all_bars
 
 
 def main():
@@ -67,7 +77,7 @@ def main():
     client = StockHistoricalDataClient(api_key, api_secret)
 
     end = datetime.now(timezone.utc)
-    start = end - timedelta(minutes=LOOKBACK_MINUTES)
+    start = end - timedelta(days=LOOKBACK_DAYS)
     bars = fetch_bars(client, SYMBOL, start, end)
 
     rows = [
@@ -93,7 +103,7 @@ def main():
         conn.commit()
 
     print(f"Upserted {len(rows)} one-minute bars for {SYMBOL} "
-          f"({start:%H:%M}–{end:%H:%M} UTC)")
+          f"({start:%Y-%m-%d %H:%M} to {end:%Y-%m-%d %H:%M} UTC)")
 
 
 if __name__ == "__main__":

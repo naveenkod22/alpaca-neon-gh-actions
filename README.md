@@ -1,16 +1,16 @@
 # AAPL → Neon via GitHub Actions
 
-Smoke test: every 10 minutes, fetch the last 10 minutes of AAPL 1-minute bars
-from Alpaca and upsert them into a Neon Postgres database. Proves GitHub Actions
-+ Neon work together before building anything real on top.
+Fetch the last 7 days of AAPL 1-minute bars from Alpaca and upsert them into
+a Neon Postgres database via GitHub Actions.
 
 ## How it works
 
-1. GitHub Actions wakes up every 10 minutes (`*/10 * * * *`), spins up a fresh
-   Ubuntu runner, checks out this repo.
-2. `fetch_aapl.py` pulls 1-minute AAPL bars from Alpaca (`feed="iex"` — the
-   free plan's feed; SIP needs a paid subscription) and upserts them into the
-   `stock_bars` table (primary key on `(symbol, ts)`, so re-runs never duplicate).
+1. GitHub Actions runs on schedule or manual trigger, spins up a fresh Ubuntu runner,
+   and checks out this repo.
+2. `fetch_aapl.py` pulls 1-minute AAPL bars from Alpaca for the last 7 days
+   (`feed="iex"` — free plan feed; with pagination support up to 10,000 bars per page)
+   and upserts them into the `stock_bars` table (primary key on `(symbol, ts)`, so
+   re-runs never duplicate).
 3. The table is created automatically on first run; `schema.sql` is the same DDL
    for manual use in Neon's SQL editor.
 
