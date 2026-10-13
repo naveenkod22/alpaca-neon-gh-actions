@@ -1,0 +1,28 @@
+name: fetch-aapl
+
+on:
+  schedule:
+    # Every 10 minutes. Note: scheduled workflows only run on the default branch,
+    # and GitHub may delay the start by a few minutes during busy periods.
+    - cron: "*/10 * * * *"
+  workflow_dispatch:  # adds a "Run workflow" button for manual testing
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Fetch AAPL bars and load into Neon
+        run: python fetch_aapl.py
+        env:
+          APCA_API_KEY_ID: ${{ secrets.APCA_API_KEY_ID }}
+          APCA_API_SECRET_KEY: ${{ secrets.APCA_API_SECRET_KEY }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
