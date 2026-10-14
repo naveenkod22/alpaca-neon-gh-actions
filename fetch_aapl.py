@@ -1,5 +1,5 @@
-"""Fetch the last 7 trading days of 1-minute bars for a list of tickers
-from Alpaca and upsert them into a Neon Postgres database.
+"""Fetch the last 10 years of 1-minute bars for a list of tickers
+from Alpaca and stream-upsert them into a Neon Postgres database.
 
 Environment variables (set as GitHub Secrets in Actions):
     APCA_API_KEY_ID      - Alpaca API key (paper-trading keys work for market data)
@@ -8,6 +8,7 @@ Environment variables (set as GitHub Secrets in Actions):
     TICKERS_FILE         - Optional: path to tickers file (default: tickers.txt)
 """
 import os
+import time
 from datetime import datetime, timedelta, timezone
 
 import psycopg
@@ -16,7 +17,7 @@ from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
 TICKERS_FILE_DEFAULT = "tickers.txt"
-TRADING_DAYS_LOOKBACK = 7
+LOOKBACK_YEARS = 10
 
 DDL = """
 CREATE TABLE IF NOT EXISTS stock_bars (
@@ -64,11 +65,9 @@ def load_tickers(file_path: str = TICKERS_FILE_DEFAULT) -> list[str]:
     tickers = []
     with open(file_path, "r") as f:
         for line in f:
-            # Strip inline comments
             line = line.split("#")[0].strip()
             if not line:
                 continue
-            # Handle comma or whitespace separated tokens
             parts = line.replace(",", " ").split()
             for part in parts:
                 clean_sym = part.strip("\"'").upper()
@@ -82,23 +81,31 @@ def load_tickers(file_path: str = TICKERS_FILE_DEFAULT) -> list[str]:
     return tickers
 
 
-def get_trading_days_start(num_trading_days: int = TRADING_DAYS_LOOKBACK) -> datetime:
-    """Calculate the start timestamp (midnight UTC) covering the last `num_trading_days` weekdays."""
-    current = datetime.now(timezone.utc)
-    trading_days = 0
-    cursor = current
-    while trading_days < num_trading_days:
-        cursor -= timedelta(days=1)
-        if cursor.weekday() < 5:  # Monday through Friday
-            trading_days += 1
-    # Start from midnight UTC of that day to encompass the full trading session
-    return cursor.replace(hour=0, minute=0, second=0, microsecond=0)
+def get_lookback_start(years: int = LOOKBACK_YEARS) -> datetime:
+    """Calculate the start timestamp (midnight UTC) going back `years` calendar years."""
+    end = datetime.now(timezone.utc)
+    try:
+        return end.replace(year=end.year - years, hour=0, minute=0, second=0, microsecond=0)
+    except ValueError:
+        # Handle leap day edge cases (e.g. Feb 29)
+        return (end - timedelta(days=years * 365 + 3)).replace(hour=0, minute=0, second=0, microsecond=0)
 
 
-def fetch_bars(client: StockHistoricalDataClient, symbol: str, start: datetime, end: datetime):
-    """Fetch all 1-minute bars for a symbol between start and end with pagination."""
-    all_bars = []
+def stream_fetch_and_upsert(
+    client: StockHistoricalDataClient,
+    symbol: str,
+    start: datetime,
+    end: datetime,
+    conn: psycopg.Connection,
+) -> int:
+    """Fetch 1-minute bars page-by-page from Alpaca and immediately upsert each batch into Neon.
+
+    Streaming page-by-page keeps memory consumption minimal and safely handles
+    hundreds of thousands of 1-minute bars across the 10-year span.
+    """
     page_token = None
+    page_num = 1
+    total_symbol_bars = 0
 
     while True:
         request = StockBarsRequest(
@@ -107,26 +114,59 @@ def fetch_bars(client: StockHistoricalDataClient, symbol: str, start: datetime, 
             start=start,
             end=end,
             feed="iex",  # Free Alpaca plan -> IEX feed
-            limit=10000,
+            limit=10000,  # Max allowable batch size per API call
             page_token=page_token,
         )
+
         bar_set = client.get_stock_bars(request)
 
-        # In alpaca-py, the dictionary of bars keyed by ticker is at .data
+        # In alpaca-py, the dictionary of bars is under .data
         bars = []
         if hasattr(bar_set, "data") and symbol in bar_set.data:
             bars = bar_set.data[symbol]
         elif symbol in bar_set:
             bars = bar_set[symbol]
 
-        all_bars.extend(bars)
-        print(f"  Fetched batch: {len(bars)} bars (page_token={page_token})")
+        if bars:
+            rows = [
+                (
+                    symbol,
+                    bar.timestamp,
+                    bar.open,
+                    bar.high,
+                    bar.low,
+                    bar.close,
+                    bar.volume,
+                    bar.trade_count,
+                    bar.vwap,
+                )
+                for bar in bars
+            ]
+
+            with conn.cursor() as cur:
+                cur.executemany(UPSERT, rows)
+            conn.commit()
+
+            total_symbol_bars += len(rows)
+            earliest_batch = bars[0].timestamp
+            latest_batch = bars[-1].timestamp
+            print(
+                f"  Page {page_num:3d}: upserted {len(rows):5d} bars "
+                f"({earliest_batch:%Y-%m-%d %H:%M} to {latest_batch:%Y-%m-%d %H:%M} UTC) "
+                f"[Total: {total_symbol_bars:,}]"
+            )
+        else:
+            print(f"  Page {page_num:3d}: 0 bars returned.")
 
         page_token = getattr(bar_set, "next_page_token", None)
         if not page_token:
             break
 
-    return all_bars
+        page_num += 1
+        # Brief pause between pages to respect Alpaca's 200 req/min rate limit
+        time.sleep(0.3)
+
+    return total_symbol_bars
 
 
 def main():
@@ -135,56 +175,36 @@ def main():
     database_url = os.environ["DATABASE_URL"]
     tickers_file = os.environ.get("TICKERS_FILE", TICKERS_FILE_DEFAULT)
 
-    # 1. Load tickers from file into a Python list
+    # 1. Load tickers
     tickers = load_tickers(tickers_file)
     print(f"Loaded {len(tickers)} ticker(s) from '{tickers_file}': {tickers}")
 
-    # 2. Compute the 7 trading days time range
+    # 2. Date window: 10 years of 1-minute bars
     client = StockHistoricalDataClient(api_key, api_secret)
     end = datetime.now(timezone.utc)
-    start = get_trading_days_start(num_trading_days=TRADING_DAYS_LOOKBACK)
-    print(f"Time window: {start:%Y-%m-%d %H:%M} to {end:%Y-%m-%d %H:%M} UTC ({TRADING_DAYS_LOOKBACK} trading days)\n")
+    start = get_lookback_start(years=LOOKBACK_YEARS)
+    print(f"Window: {start:%Y-%m-%d %H:%M} to {end:%Y-%m-%d %H:%M} UTC ({LOOKBACK_YEARS} years, 1-minute interval)\n")
 
-    # 3. Connect to Neon and process each ticker
+    # 3. Connect to Neon and process tickers
     print("Connecting to Neon database...")
     with psycopg.connect(database_url) as conn:
         with conn.cursor() as cur:
             cur.execute(DDL)
         conn.commit()
 
-        total_upserted = 0
+        grand_total = 0
         for symbol in tickers:
-            print(f"[{symbol}] Fetching data...")
+            print(f"[{symbol}] Starting 10-year 1-minute bar extraction...")
+            t0 = time.time()
             try:
-                bars = fetch_bars(client, symbol, start, end)
-                rows = [
-                    (
-                        symbol,
-                        bar.timestamp,
-                        bar.open,
-                        bar.high,
-                        bar.low,
-                        bar.close,
-                        bar.volume,
-                        bar.trade_count,
-                        bar.vwap,
-                    )
-                    for bar in bars
-                ]
-
-                if rows:
-                    with conn.cursor() as cur:
-                        cur.executemany(UPSERT, rows)
-                    conn.commit()
-                    total_upserted += len(rows)
-                    print(f"[{symbol}] Successfully upserted {len(rows)} bars into Neon.\n")
-                else:
-                    print(f"[{symbol}] No bars returned for the given window.\n")
-
+                upserted = stream_fetch_and_upsert(client, symbol, start, end, conn)
+                grand_total += upserted
+                elapsed = time.time() - t0
+                print(f"[{symbol}] Complete: {upserted:,} total bars upserted in {elapsed:.1f}s.\n")
             except Exception as e:
-                print(f"[{symbol}] Error fetching or storing data: {e}\n")
+                print(f"[{symbol}] Error fetching/storing data: {e}\n")
 
-    print(f"Finished! Total bars upserted across all {len(tickers)} ticker(s): {total_upserted}")
+    print(f"Finished! Total 1-minute bars upserted across all tickers: {grand_total:,}")
 
 
 if __name__ == "__main__":

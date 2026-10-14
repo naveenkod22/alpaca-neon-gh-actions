@@ -1,18 +1,18 @@
 # Multi-Ticker Stock Data → Neon via GitHub Actions
 
-Fetch the last 7 trading days of 1-minute bars for a list of tickers from Alpaca
-and upsert them into a Neon Postgres database via GitHub Actions.
+Fetch the last 10 years of 1-minute bars for a list of tickers from Alpaca
+and stream-upsert them into a Neon Postgres database via GitHub Actions.
 
 ## How it works
 
 1. GitHub Actions runs on schedule or manual trigger, spins up an Ubuntu runner,
    and checks out this repo.
 2. `fetch_aapl.py` loads tickers from `tickers.txt` as a Python list.
-3. For each ticker, it pulls 1-minute bars from Alpaca for the last 7 trading days
-   (`feed="iex"` — free plan feed; with pagination support up to 10,000 bars per page)
-   and upserts them into the `stock_bars` table (primary key on `(symbol, ts)`, so
-   re-runs never duplicate).
-4. The table is created automatically on first run; `schema.sql` is the same DDL
+3. For each ticker, it pulls 1-minute bars from Alpaca across the last 10 years
+   (`feed="iex"` — free plan feed; batches of up to 10,000 bars per page).
+4. Each page is immediately upserted and committed to the `stock_bars` table in Neon
+   (`ON CONFLICT (symbol, ts) DO UPDATE`), keeping memory usage minimal.
+5. The table is created automatically on first run; `schema.sql` is the same DDL
    for manual inspection in Neon's SQL editor.
 
 ## Setup (5 minutes)
