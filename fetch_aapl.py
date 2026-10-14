@@ -103,19 +103,18 @@ def stream_fetch_and_upsert(
     Streaming page-by-page keeps memory consumption minimal and safely handles
     hundreds of thousands of 1-minute bars across the 10-year span.
     """
-    page_token = None
+    current_start = start
     page_num = 1
     total_symbol_bars = 0
 
-    while True:
+    while current_start < end:
         request = StockBarsRequest(
             symbol_or_symbols=symbol,
             timeframe=TimeFrame.Minute,
-            start=start,
+            start=current_start,
             end=end,
             feed="iex",  # Free Alpaca plan -> IEX feed
             limit=10000,  # Max allowable batch size per API call
-            page_token=page_token,
         )
 
         bar_set = client.get_stock_bars(request)
@@ -127,43 +126,49 @@ def stream_fetch_and_upsert(
         elif symbol in bar_set:
             bars = bar_set[symbol]
 
-        if bars:
-            rows = [
-                (
-                    symbol,
-                    bar.timestamp,
-                    bar.open,
-                    bar.high,
-                    bar.low,
-                    bar.close,
-                    bar.volume,
-                    bar.trade_count,
-                    bar.vwap,
-                )
-                for bar in bars
-            ]
-
-            with conn.cursor() as cur:
-                cur.executemany(UPSERT, rows)
-            conn.commit()
-
-            total_symbol_bars += len(rows)
-            earliest_batch = bars[0].timestamp
-            latest_batch = bars[-1].timestamp
-            print(
-                f"  Page {page_num:3d}: upserted {len(rows):5d} bars "
-                f"({earliest_batch:%Y-%m-%d %H:%M} to {latest_batch:%Y-%m-%d %H:%M} UTC) "
-                f"[Total: {total_symbol_bars:,}]"
-            )
-        else:
-            print(f"  Page {page_num:3d}: 0 bars returned.")
-
-        page_token = getattr(bar_set, "next_page_token", None)
-        if not page_token:
+        if not bars:
+            print(f"  Page {page_num:3d}: 0 bars returned. No further data available.")
             break
 
+        rows = [
+            (
+                symbol,
+                bar.timestamp,
+                bar.open,
+                bar.high,
+                bar.low,
+                bar.close,
+                bar.volume,
+                bar.trade_count,
+                bar.vwap,
+            )
+            for bar in bars
+        ]
+
+        with conn.cursor() as cur:
+            cur.executemany(UPSERT, rows)
+        conn.commit()
+
+        total_symbol_bars += len(rows)
+        earliest_batch = bars[0].timestamp
+        latest_batch = bars[-1].timestamp
+        print(
+            f"  Page {page_num:3d}: upserted {len(rows):5d} bars "
+            f"({earliest_batch:%Y-%m-%d %H:%M} to {latest_batch:%Y-%m-%d %H:%M} UTC) "
+            f"[Total: {total_symbol_bars:,}]"
+        )
+
+        # If Alpaca returned fewer than 10,000 bars, we have reached the end of the window
+        if len(bars) < 10000:
+            break
+
+        # Advance current_start to strictly after the last bar's timestamp
+        next_start = latest_batch + timedelta(seconds=1)
+        if next_start <= current_start:
+            break
+
+        current_start = next_start
         page_num += 1
-        # Brief pause between pages to respect Alpaca's 200 req/min rate limit
         time.sleep(0.3)
 
     return total_symbol_bars
