@@ -1,0 +1,4 @@
+# List of stock tickers to fetch (one per line)
+AAPL
+MSFT
+NVDA
